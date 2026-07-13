@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Added TuringDB-style Parquet output via `--format parquet`, including graph node/edge files, fixed-width binary account embeddings, fraud case Parquet metadata, and verifier support.
+- Automatically compact Parquet shards into top-level `nodes.parquet` and `edges.parquet` files for TuringDB `LOAD PARQUET`.
+
 ## [0.1.0] - 2026-07-06
 
 ### Added

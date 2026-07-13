@@ -11,7 +11,12 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from gen_fraud_graph.embeddings import EmbeddingGenerator
-from gen_fraud_graph.exporters import get_headers, write_output
+from gen_fraud_graph.exporters import (
+    get_headers,
+    parquet_schema,
+    write_output,
+    write_parquet_table,
+)
 
 # ---------------------------------------------------------------------------
 # Suspicious transaction descriptions used across typologies
@@ -118,18 +123,35 @@ class FraudRingGenerator:
                 desc = random.choice(self._descriptions)
                 batch_texts.append(desc)
 
-                row: list = [f"tx_{current_tx_id}", src, dst]
-                if fmt == "neptune":
-                    row.append("TRANSFER")
-                row.extend([self.amount, "2024-01-01T12:00:00", desc])
+                if fmt == "parquet":
+                    row = [current_tx_id, ring_ids[k], ring_ids[(k + 1) % depth], self.amount, desc]
+                else:
+                    row = [f"tx_{current_tx_id}", src, dst]
+                    if fmt == "neptune":
+                        row.append("TRANSFER")
+                    row.extend([self.amount, "2024-01-01T12:00:00", desc])
                 batch_rows.append(row)
                 current_tx_id += 1
 
-            embeddings = embedder.generate(batch_texts)
+            embeddings = embedder.generate(batch_texts) if fmt != "parquet" else []
 
             for idx, r in enumerate(batch_rows):
                 if fmt == "neptune":
                     tx_rows.append(r)
+                elif fmt == "parquet":
+                    tx_id, src_id, dst_id, amount, desc = r
+                    tx_rows.append(
+                        [
+                            src_id,
+                            dst_id,
+                            b"TRANSFER",
+                            tx_id,
+                            amount,
+                            "2024-01-01T12:00:00",
+                            desc,
+                            True,
+                        ]
+                    )
                 else:
                     vec = embeddings[idx]
                     if isinstance(vec, np.ndarray):
@@ -139,16 +161,29 @@ class FraudRingGenerator:
             case_rows.append(
                 [
                     f"pat_{pattern_id}",
-                    accounts[0],
+                    ring_ids[0] if fmt == "parquet" else accounts[0],
                     "cycle",
                     depth,
-                    involved,
+                    "|".join(str(i) for i in ring_ids) if fmt == "parquet" else involved,
                 ]
             )
 
         file_tx = os.path.join(fraud_dir, "transactions_fraud")
         file_cases = os.path.join(fraud_dir, "fraud_cases")
-        write_output(file_tx, headers_tx, tx_rows, compress=compress)
-        write_output(file_cases, headers_cases, case_rows, compress=compress)
+        if fmt == "parquet":
+            graph_dir = os.path.join(output_dir, "graph")
+            write_parquet_table(
+                os.path.join(graph_dir, "edges_fraud.parquet"),
+                parquet_schema("transaction", embedder.dim),
+                (list(zip(*tx_rows, strict=True)) if tx_rows else [[], [], [], [], [], [], [], []]),
+            )
+            write_parquet_table(
+                f"{file_cases}.parquet",
+                parquet_schema("fraud_case"),
+                list(zip(*case_rows, strict=True)) if case_rows else [[], [], [], [], []],
+            )
+        else:
+            write_output(file_tx, headers_tx, tx_rows, compress=compress)
+            write_output(file_cases, headers_cases, case_rows, compress=compress)
 
         return len(tx_rows), current_tx_id

@@ -65,3 +65,20 @@ class TestVerifyExtra:
         with pytest.raises(SystemExit) as exc:
             verify_main()
         assert exc.value.code == 0
+
+
+def test_verify_parquet_patterns(tmp_dir):
+    from gen_fraud_graph.config import Config
+
+    cfg = Config(
+        scale_factor=0.0001,
+        num_fraud_rings=3,
+        embedding_provider="fake",
+        embedding_dim=8,
+        output_format="parquet",
+        output_dir=tmp_dir,
+    )
+    FraudGraphGenerator(cfg).run()
+
+    cases_path = os.path.join(tmp_dir, "fraud", "fraud_cases.parquet")
+    assert verify_fraud_patterns(cases_path, tmp_dir)

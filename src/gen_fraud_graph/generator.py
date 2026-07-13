@@ -15,7 +15,12 @@ from tqdm import tqdm
 
 from gen_fraud_graph.config import Config
 from gen_fraud_graph.embeddings import EmbeddingGenerator
-from gen_fraud_graph.exporters import get_headers
+from gen_fraud_graph.exporters import (
+    compact_parquet_files,
+    embedding_to_bytes,
+    get_headers,
+    parquet_schema,
+)
 from gen_fraud_graph.typologies import FraudRingGenerator
 
 # ---------------------------------------------------------------------------
@@ -63,6 +68,179 @@ def _split_workload(total: int, num_shards: int) -> list[tuple[int, int]]:
 # ---------------------------------------------------------------------------
 
 
+def _generate_accounts_parquet_chunk(
+    worker_id: int,
+    batch_id: int,
+    start_id: int,
+    count: int,
+    provider: str,
+    dim: int,
+    output_dir: str,
+) -> str:
+    """Generate TuringDB-style account node and embedding Parquet chunks."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    random.seed(start_id)
+    embedder = EmbeddingGenerator(provider, dim=dim)  # type: ignore[arg-type]
+
+    graph_dir = os.path.join(output_dir, "graph")
+    embedding_dir = os.path.join(output_dir, "embeddings")
+    os.makedirs(graph_dir, exist_ok=True)
+    os.makedirs(embedding_dir, exist_ok=True)
+
+    node_path = os.path.join(graph_dir, f"nodes_{worker_id}_{batch_id}.parquet")
+    embedding_path = os.path.join(
+        embedding_dir, f"account_embeddings_{worker_id}_{batch_id}.parquet"
+    )
+
+    if os.path.exists(node_path) and os.path.exists(embedding_path):
+        return f"Worker {worker_id} Batch {batch_id}: Skipped (already complete)"
+
+    node_schema = parquet_schema("account")
+    embedding_schema = parquet_schema("embedding", dim)
+    node_label = [b"Account"]
+    node_label_type = node_schema.field("__labels").type
+
+    batch_size = 5_000
+    node_writer = pq.ParquetWriter(node_path, node_schema, compression="zstd")
+    embedding_writer = pq.ParquetWriter(embedding_path, embedding_schema, compression="zstd")
+    try:
+        for i in range(0, count, batch_size):
+            chunk_count = min(batch_size, count - i)
+            batch_ids: list[int] = []
+            batch_texts: list[str] = []
+            names: list[str] = []
+            balances: list[float] = []
+            risk_scores: list[float] = []
+            creation_dates: list[str] = []
+
+            for j in range(chunk_count):
+                uid = start_id + i + j
+                name = f"Customer_{uid}"
+                balance = round(random.uniform(100, 100_000), 2)
+                risk_score = round(random.uniform(0, 1), 4)
+                batch_ids.append(uid)
+                batch_texts.append(name)
+                names.append(name)
+                balances.append(balance)
+                risk_scores.append(risk_score)
+                creation_dates.append("2023-01-01")
+
+            embeddings = embedder.generate(batch_texts)
+            embedding_values = [embedding_to_bytes(embeddings[idx]) for idx in range(chunk_count)]
+
+            node_table = pa.Table.from_arrays(
+                [
+                    pa.array(batch_ids, type=pa.int64()),
+                    pa.array([node_label] * chunk_count, type=node_label_type),
+                    pa.array(batch_ids, type=pa.uint64()),
+                    pa.array(names, type=pa.string()),
+                    pa.array(balances, type=pa.float64()),
+                    pa.array(risk_scores, type=pa.float64()),
+                    pa.array(creation_dates, type=pa.string()),
+                ],
+                schema=node_schema,
+            )
+            embedding_table = pa.Table.from_arrays(
+                [
+                    pa.array(batch_ids, type=pa.int64()),
+                    pa.array(embedding_values, type=embedding_schema.field("embedding").type),
+                ],
+                schema=embedding_schema,
+            )
+            node_writer.write_table(node_table, row_group_size=65536)
+            embedding_writer.write_table(embedding_table, row_group_size=65536)
+
+            if (i + chunk_count) % 50_000 == 0:
+                print(f"  Worker {worker_id} Batch {batch_id}: {i + chunk_count} accounts written")
+    finally:
+        node_writer.close()
+        embedding_writer.close()
+
+    return f"Worker {worker_id} Batch {batch_id}: Generated {count} account nodes"
+
+
+def _generate_transactions_parquet_chunk(
+    worker_id: int,
+    batch_id: int,
+    start_tx_id: int,
+    count: int,
+    total_accounts: int,
+    provider: str,
+    dim: int,
+    output_dir: str,
+) -> str:
+    """Generate a TuringDB-style transaction edge Parquet chunk."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    random.seed(start_tx_id)
+    _ = (provider, dim)
+
+    graph_dir = os.path.join(output_dir, "graph")
+    os.makedirs(graph_dir, exist_ok=True)
+
+    edge_path = os.path.join(graph_dir, f"edges_{worker_id}_{batch_id}.parquet")
+    if os.path.exists(edge_path):
+        return f"Worker {worker_id} Batch {batch_id}: Skipped (already complete)"
+
+    edge_schema = parquet_schema("transaction", dim)
+
+    embed_batch_size = 5_000
+    edge_writer = pq.ParquetWriter(edge_path, edge_schema, compression="zstd")
+    try:
+        for i in range(0, count, embed_batch_size):
+            chunk_count = min(embed_batch_size, count - i)
+            sources: list[int] = []
+            targets: list[int] = []
+            tx_ids: list[int] = []
+            amounts: list[float] = []
+            timestamps: list[str] = []
+            descriptions: list[str] = []
+
+            for j in range(chunk_count):
+                tx_uid = start_tx_id + i + j
+                src = random.randint(0, total_accounts - 1)
+                dst = random.randint(0, total_accounts - 1)
+                while src == dst:
+                    dst = random.randint(0, total_accounts - 1)
+
+                desc = random.choice(NORMAL_DESCRIPTIONS)
+                amount = round(random.uniform(10, 500), 2)
+                sources.append(src)
+                targets.append(dst)
+                tx_ids.append(tx_uid)
+                amounts.append(amount)
+                timestamps.append("2024-01-01T10:00:00")
+                descriptions.append(desc)
+
+            table = pa.Table.from_arrays(
+                [
+                    pa.array(sources, type=pa.int64()),
+                    pa.array(targets, type=pa.int64()),
+                    pa.array([b"TRANSFER"] * chunk_count, type=pa.binary()),
+                    pa.array(tx_ids, type=pa.int64()),
+                    pa.array(amounts, type=pa.float64()),
+                    pa.array(timestamps, type=pa.string()),
+                    pa.array(descriptions, type=pa.string()),
+                    pa.array([False] * chunk_count, type=pa.bool_()),
+                ],
+                schema=edge_schema,
+            )
+            edge_writer.write_table(table, row_group_size=65536)
+
+            if (i + chunk_count) % 50_000 == 0:
+                print(
+                    f"  Worker {worker_id} Batch {batch_id}: "
+                    f"{i + chunk_count} transactions written"
+                )
+    finally:
+        edge_writer.close()
+
+    return f"Worker {worker_id} Batch {batch_id}: Generated {count} transaction edges"
+
+
 def _generate_accounts_chunk(
     worker_id: int,
     batch_id: int,
@@ -74,6 +252,11 @@ def _generate_accounts_chunk(
     fmt: str = "csv",
 ) -> str:
     """Generate a chunk of account rows (called by ProcessPoolExecutor)."""
+    if fmt == "parquet":
+        return _generate_accounts_parquet_chunk(
+            worker_id, batch_id, start_id, count, provider, dim, output_dir
+        )
+
     random.seed(start_id)
     embedder = EmbeddingGenerator(provider, dim=dim)  # type: ignore[arg-type]
 
@@ -151,6 +334,11 @@ def _generate_transactions_chunk(
     fmt: str = "csv",
 ) -> str:
     """Generate a chunk of transaction rows (called by ProcessPoolExecutor)."""
+    if fmt == "parquet":
+        return _generate_transactions_parquet_chunk(
+            worker_id, batch_id, start_tx_id, count, total_accounts, provider, dim, output_dir
+        )
+
     random.seed(start_tx_id)
     embedder = EmbeddingGenerator(provider, dim=dim)  # type: ignore[arg-type]
 
@@ -243,9 +431,11 @@ class FraudGraphGenerator:
 
     The output directory will contain:
 
-    * ``accounts/``  — account node CSVs (one per worker × batch)
-    * ``transactions/`` — legitimate transaction edge CSVs
-    * ``fraud/`` — ``transactions_fraud.csv`` and ``fraud_cases.csv``
+    * ``accounts/``  — account node CSVs (CSV/Neptune output)
+    * ``transactions/`` — legitimate transaction edge CSVs (CSV/Neptune output)
+    * ``graph/`` — TuringDB-style node and edge Parquet chunks (Parquet output)
+    * ``embeddings/`` — fixed-width binary account embeddings (Parquet output)
+    * ``fraud/`` — fraud transaction edges and case metadata
     """
 
     def __init__(self, config: Config) -> None:
@@ -285,6 +475,9 @@ class FraudGraphGenerator:
 
         # Phase 3 — Fraud rings
         self._generate_fraud()
+
+        if cfg.output_format == "parquet":
+            self._compact_parquet()
 
         print("\nDone! All data generated.")
 
@@ -367,3 +560,37 @@ class FraudGraphGenerator:
             compress=cfg.compress,
         )
         print(f"  Injected {n_tx:,} fraud transactions across {cfg.num_fraud_rings:,} rings")
+
+    def _compact_parquet(self) -> None:
+        cfg = self.cfg
+        graph_dir = os.path.join(cfg.output_dir, "graph")
+        node_paths = sorted(
+            os.path.join(graph_dir, name)
+            for name in os.listdir(graph_dir)
+            if name.startswith("nodes_") and name.endswith(".parquet")
+        )
+        edge_paths = sorted(
+            os.path.join(graph_dir, name)
+            for name in os.listdir(graph_dir)
+            if name.startswith("edges_")
+            and name.endswith(".parquet")
+            and name != "edges_fraud.parquet"
+        )
+
+        fraud_edges = os.path.join(graph_dir, "edges_fraud.parquet")
+        if os.path.exists(fraud_edges):
+            edge_paths.append(fraud_edges)
+
+        if not node_paths:
+            raise FileNotFoundError(f"No node Parquet shards found in {graph_dir}")
+        if not edge_paths:
+            raise FileNotFoundError(f"No edge Parquet shards found in {graph_dir}")
+
+        nodes_out = os.path.join(cfg.output_dir, "nodes.parquet")
+        edges_out = os.path.join(cfg.output_dir, "edges.parquet")
+
+        print("\n[Phase 4] Compacting Parquet shards for LOAD PARQUET...")
+        print(f"  Nodes: {len(node_paths)} shards -> {nodes_out}")
+        compact_parquet_files(node_paths, nodes_out)
+        print(f"  Edges: {len(edge_paths)} shards -> {edges_out}")
+        compact_parquet_files(edge_paths, edges_out)

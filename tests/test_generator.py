@@ -103,3 +103,65 @@ class TestFraudGraphGenerator:
         assert not os.path.isdir(os.path.join(out, "accounts"))
         assert os.path.isdir(os.path.join(out, "transactions"))
         assert os.path.isdir(os.path.join(out, "fraud"))
+
+
+class TestParquetGeneration:
+    def test_accounts_chunk_parquet(self, tmp_dir):
+        import pyarrow.parquet as pq
+
+        msg = _generate_accounts_chunk(0, 0, 0, 10, "fake", 16, tmp_dir, "parquet")
+        assert "Generated" in msg
+
+        node_path = os.path.join(tmp_dir, "graph", "nodes_0_0.parquet")
+        emb_path = os.path.join(tmp_dir, "embeddings", "account_embeddings_0_0.parquet")
+        assert os.path.exists(node_path)
+        assert os.path.exists(emb_path)
+        node_schema = pq.read_schema(node_path)
+        assert "__id" in node_schema.names
+        assert "__labels" in node_schema.names
+        assert str(node_schema.field("account_id").type) == "uint64"
+        assert pq.read_schema(emb_path).field("embedding").type.byte_width == 64
+
+    def test_transactions_chunk_parquet(self, tmp_dir):
+        import pyarrow.parquet as pq
+
+        msg = _generate_transactions_chunk(0, 0, 0, 20, 100, "fake", 16, tmp_dir, "parquet")
+        assert "Generated" in msg
+
+        edge_path = os.path.join(tmp_dir, "graph", "edges_0_0.parquet")
+        assert os.path.exists(edge_path)
+        schema = pq.read_schema(edge_path)
+        assert "__source" in schema.names
+        assert "__target" in schema.names
+        assert "__type" in schema.names
+        assert "is_fraud" in schema.names
+
+    def test_full_pipeline_parquet(self, tmp_dir):
+        import pyarrow.parquet as pq
+
+        from gen_fraud_graph.config import Config
+
+        cfg = Config(
+            scale_factor=0.0001,
+            num_fraud_rings=5,
+            embedding_provider="fake",
+            embedding_dim=16,
+            output_format="parquet",
+            output_dir=tmp_dir,
+        )
+        FraudGraphGenerator(cfg).run()
+
+        assert os.path.exists(os.path.join(tmp_dir, "graph", "nodes_0_0.parquet"))
+        assert os.path.exists(os.path.join(tmp_dir, "graph", "edges_0_0.parquet"))
+        assert os.path.exists(os.path.join(tmp_dir, "graph", "edges_fraud.parquet"))
+        assert os.path.exists(os.path.join(tmp_dir, "fraud", "fraud_cases.parquet"))
+
+        nodes_path = os.path.join(tmp_dir, "nodes.parquet")
+        edges_path = os.path.join(tmp_dir, "edges.parquet")
+        fraud_edges_path = os.path.join(tmp_dir, "graph", "edges_fraud.parquet")
+        assert os.path.exists(nodes_path)
+        assert os.path.exists(edges_path)
+        assert pq.ParquetFile(nodes_path).metadata.num_rows == cfg.num_accounts
+        assert pq.ParquetFile(edges_path).metadata.num_rows == (
+            cfg.num_transactions + pq.ParquetFile(fraud_edges_path).metadata.num_rows
+        )

@@ -31,7 +31,7 @@ The generator creates three types of data:
 - **Fraud pattern injection** — Cyclic money-laundering rings with configurable depth (4–7 hops)
 - **Parallel generation** — Multi-process workers for fast generation on high-core machines
 - **Vector embeddings** — Three providers: `fake` (random, fast), `local` (SentenceTransformers), `openai` (API)
-- **Multiple formats** — Generic CSV or AWS Neptune bulk-load format
+- **Multiple formats** — Generic CSV, AWS Neptune bulk-load, or TuringDB-style Parquet format
 - **Resume support** — Interrupted generation can resume from where it left off
 - **Privacy by design** — All data is 100% synthetic; no real financial data is used
 
@@ -89,6 +89,9 @@ gen-fraud-graph --scale 1.0 --workers 24 --output ./data
 # Neptune bulk-load format
 gen-fraud-graph --scale 0.01 --format neptune --output ./neptune_data
 
+# TuringDB-style Parquet graph format
+gen-fraud-graph --scale 0.01 --format parquet --output ./parquet_data
+
 # Resume interrupted generation (skips completed files)
 gen-fraud-graph --scale 1.0 --workers 24 --skip-accounts --output ./data
 ```
@@ -102,7 +105,7 @@ gen-fraud-graph --scale 1.0 --workers 24 --skip-accounts --output ./data
 | `--output` | `data` | Output directory for generated CSV files. |
 | `--workers` | `1` | Number of parallel worker processes. |
 | `--batches` | `1` | Number of file chunks per worker. |
-| `--format` | `csv` | Output format: `csv` (generic) or `neptune` (AWS Neptune bulk-load). |
+| `--format` | `csv` | Output format: `csv` (generic), `neptune` (AWS Neptune bulk-load), or `parquet` (TuringDB-style graph files). |
 | `--fraud-rings` | auto | Number of fraud rings. Default: auto-scaled from `--scale`. |
 | `--compress` | off | ZIP-compress output CSV files. |
 | `--skip-accounts` | off | Skip account generation (useful when resuming). |
@@ -140,14 +143,24 @@ python -m gen_fraud_graph.verify --data-dir ./data
 ```
 data/
 ├── accounts/
-│   ├── accounts_0_0.csv       # Account nodes (worker 0, batch 0)
-│   └── accounts_1_0.csv       # Account nodes (worker 1, batch 0)
+│   ├── accounts_0_0.csv       # Account nodes (CSV/Neptune output)
+│   └── accounts_1_0.csv
 ├── transactions/
-│   ├── transactions_0_0.csv   # Transaction edges (worker 0, batch 0)
-│   └── transactions_1_0.csv   # Transaction edges (worker 1, batch 0)
+│   ├── transactions_0_0.csv   # Transaction edges (CSV/Neptune output)
+│   └── transactions_1_0.csv
 └── fraud/
-    ├── transactions_fraud.csv  # Fraud ring transaction edges
+    ├── transactions_fraud.csv  # Fraud ring transaction edges (CSV/Neptune output)
     └── fraud_cases.csv         # Fraud ring metadata (pattern_id, accounts, depth)
+
+parquet_data/
+├── graph/
+│   ├── nodes_0_0.parquet       # TuringDB node table: id, label, properties
+│   ├── edges_0_0.parquet       # TuringDB edge table: from, to, relation, properties
+│   └── edges_fraud.parquet     # Fraud transaction edges
+├── embeddings/
+│   └── account_embeddings_0_0.parquet
+└── fraud/
+    └── fraud_cases.parquet
 ```
 
 ### CSV Schema
@@ -183,6 +196,58 @@ data/
 | `pattern_type` | string | Always `"cycle"` |
 | `depth` | int | Number of hops in the ring (4–7) |
 | `involved_accounts` | string | Pipe-separated list of accounts |
+
+**Parquet graph files** (`--format parquet`)
+
+Parquet output follows the split graph table shape expected by TuringDB's `LOAD PARQUET` importer. At the end of a Parquet run, generated shards are automatically compacted to top-level `nodes.parquet` and `edges.parquet` files.
+
+**Parquet node schema**
+
+| Column | Type | Description |
+|:---|:---|:---|
+| `__id` | `int64` | Internal ascending graph node id used by edges. |
+| `__labels` | `list<binary>` | Always `Account`. |
+| `account_id` | `uint64` | Original account number, e.g. `42` for `acc_42`. |
+| `customer_name` | `string` | Synthetic customer name. |
+| `balance` | `float64` | Account balance. |
+| `risk_score` | `float64` | Risk score. |
+| `creation_date` | `string` | Account creation date. |
+
+**Parquet edge schema**
+
+| Column | Type | Description |
+|:---|:---|:---|
+| `__source` | `int64` | Source node `__id`. |
+| `__target` | `int64` | Target node `__id`. |
+| `__type` | `binary` | Always `TRANSFER`. |
+| `tx_id` | `int64` | Transaction id. |
+| `amount` | `float64` | Transaction amount. |
+| `timestamp` | `string` | Transaction timestamp. |
+| `description` | `string` | Transaction description. |
+| `is_fraud` | `bool` | `true` for fraud edges. |
+
+| File | Key columns | Notes |
+|:---|:---|:---|
+| `nodes.parquet` | `__id`, `__labels`, `account_id` | Compacted account nodes for `LOAD PARQUET`. |
+| `edges.parquet` | `__source`, `__target`, `__type` | Compacted normal and fraud edges for `LOAD PARQUET`. |
+| `graph/nodes_*.parquet` | `__id`, `__labels`, `account_id` | Intermediate account node shards. |
+| `graph/edges_*.parquet` | `__source`, `__target`, `__type` | Intermediate normal and fraud edge shards. |
+| `embeddings/account_embeddings_*.parquet` | `node_id`, `embedding` | Raw float32 embedding bytes stored as fixed-width binary for `LOAD EMBEDDING`; compact to one file if needed. |
+| `fraud/fraud_cases.parquet` | `pattern_id`, `start_acc_id`, `depth`, `involved_accounts` | Fraud ring metadata sidecar. |
+
+A TuringDB import directory should live under the TuringDB data directory and contain exactly:
+
+```text
+.turing/data/gen_fraud_graph_1m/
+├── nodes.parquet
+└── edges.parquet
+```
+
+Then import with:
+
+```cypher
+LOAD PARQUET 'gen_fraud_graph_1m' AS gen_fraud_graph_1m
+```
 
 ---
 
@@ -241,6 +306,7 @@ Core (always installed):
 - NumPy >= 1.24
 - Pandas >= 2.0
 - tqdm >= 4.65
+- PyArrow >= 15.0
 
 Optional:
 - `sentence-transformers >= 2.2` — for `--provider local`

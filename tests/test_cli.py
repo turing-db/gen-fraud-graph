@@ -49,3 +49,23 @@ class TestCLI:
             ]
         )
         assert os.path.exists(os.path.join(tmp_dir, "fraud", "fraud_cases.csv.zip"))
+
+    def test_main_parquet(self, tmp_dir):
+        from gen_fraud_graph.cli import main
+
+        main(
+            [
+                "--scale",
+                "0.0001",
+                "--provider",
+                "fake",
+                "--output",
+                tmp_dir,
+                "--format",
+                "parquet",
+                "--fraud-rings",
+                "3",
+            ]
+        )
+        assert os.path.exists(os.path.join(tmp_dir, "graph", "nodes_0_0.parquet"))
+        assert os.path.exists(os.path.join(tmp_dir, "graph", "edges_0_0.parquet"))
