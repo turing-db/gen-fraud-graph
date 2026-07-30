@@ -263,6 +263,22 @@ LOAD PARQUET 'gen_fraud_graph_1m' AS gen_fraud_graph_1m
 
 ---
 
+## Benchmarks
+
+Cold query latency for the whole-graph fraud-detection queries on the `0.1` graph
+(~1M accounts / ~9M transactions), in milliseconds (ms) — lower is better.
+Reproduce with [`benchmark/`](benchmark/) (TuringDB vs Neo4j vs Memgraph, cold and index-free).
+
+| Query | Result | TuringDB (ms) | Memgraph (ms) | Neo4j (ms) | Speedup vs Memgraph | Speedup vs Neo4j |
+|:---|--:|--:|--:|--:|--:|--:|
+| 2-hop fraud chain     | 549 | 169 | 3,207 | 5,765 | 19.0× | 34.1× |
+| 3-hop fraud chain     | 549 | 170 | 3,184 | 6,307 | 18.7× | 37.1× |
+| 4-hop fraud chain     | 549 | 171 | 3,183 | 6,272 | 18.6× | 36.7× |
+| 2-hop into high-risk  | 543 | 175 | 3,487 | 5,904 | 19.9× | 33.7× |
+| High-amount aggregate | 549 | 173 | 3,171 | 5,562 | 18.3× | 32.2× |
+
+---
+
 ## Project Structure
 
 ```
